@@ -40,6 +40,12 @@ class AttentionAnalyzer:
             trust_remote_code=True,
             token=token
         )
+        # Set attention implementation to 'eager' to support output_attentions
+        if hasattr(self.model.config, 'attn_implementation'):
+            self.model.config.attn_implementation = 'eager'
+        # Also set it on the model if the method exists
+        if hasattr(self.model, 'set_attn_implementation'):
+            self.model.set_attn_implementation('eager')
         self.model.eval()
         
         # Store attention weights for each layer
@@ -146,8 +152,9 @@ class AttentionAnalyzer:
                     
                     # Compute Q, K, V
                     batch_size, seq_len, hidden_size = hidden_states.shape
-                    num_heads = attn_module.num_heads
-                    head_dim = getattr(attn_module, 'head_dim', hidden_size // num_heads)
+                    # Get num_heads from config (Llama models have this in config)
+                    num_heads = self.model.config.num_attention_heads
+                    head_dim = hidden_size // num_heads
                     
                     query_states = attn_module.q_proj(hidden_states)
                     key_states = attn_module.k_proj(hidden_states)
@@ -211,16 +218,36 @@ class AttentionAnalyzer:
         # attention_weights: [batch, num_heads, seq_len, seq_len]
         batch_size, num_heads, seq_len, _ = attention_weights.shape
         
-        # Avoid log(0) by adding small epsilon
-        eps = 1e-10
-        attn_with_eps = attention_weights + eps
+        # Check for NaN or Inf values
+        if torch.isnan(attention_weights).any() or torch.isinf(attention_weights).any():
+            # Replace NaN and Inf with small epsilon
+            attention_weights = attention_weights.clone()
+            attention_weights[torch.isnan(attention_weights)] = 1e-10
+            attention_weights[torch.isinf(attention_weights)] = 1e-10
+        
+        # Normalize attention weights per query position (each row should sum to 1)
+        # Sum over key dimension (last dim) for each query
+        attn_sums = attention_weights.sum(dim=-1, keepdim=True)  # [batch, num_heads, seq_len, 1]
+        # Avoid division by zero
+        attn_sums = torch.clamp(attn_sums, min=1e-10)
+        attention_weights_normalized = attention_weights / attn_sums
+        
+        # Ensure attention weights are non-negative and not too small
+        attention_weights_normalized = torch.clamp(attention_weights_normalized, min=1e-10, max=1.0)
         
         # Compute entropy: -A * log(A) for each position
-        entropy = -attn_with_eps * torch.log(attn_with_eps)
+        # For each query position, compute entropy over key positions
+        log_attn = torch.log(attention_weights_normalized)
+        entropy = -attention_weights_normalized * log_attn
         
-        # Sum over all positions and average
-        # AE = -1/(N*H) * sum_{h,i,j} A_{h,i,j} * log(A_{h,i,j})
-        ae = entropy.sum() / (batch_size * num_heads * seq_len * seq_len)
+        # Sum over key positions for each query position, then average over queries, heads, and batches
+        # AE = average entropy over all query positions, heads, and batches
+        # For each query position, entropy is sum over key positions
+        ae = entropy.sum() / (batch_size * num_heads * seq_len)
+        
+        # Check if result is valid
+        if torch.isnan(ae) or torch.isinf(ae) or ae.item() < 0:
+            return 0.0
         
         return ae.item()
     
@@ -283,11 +310,132 @@ class AttentionAnalyzer:
         
         return hta
     
+    def _word_indices_to_token_indices(
+        self, 
+        prompt: str, 
+        word_indices: List[int]
+    ) -> List[int]:
+        """
+        Convert word indices (0-indexed) to token indices (0-indexed).
+        
+        Args:
+            prompt: Input text prompt
+            word_indices: List of word indices (0-indexed) in the original prompt
+        
+        Returns:
+            List of token indices (0-indexed) corresponding to the given word indices
+        """
+        # Tokenize with offset mapping to get character positions
+        encoding = self.tokenizer(
+            prompt,
+            return_offsets_mapping=True,
+            return_attention_mask=False,
+            return_tensors=None  # Return as lists, not tensors
+        )
+        
+        # Get offset_mapping - handle different return formats
+        offset_mapping = encoding['offset_mapping']
+        if isinstance(offset_mapping, list):
+            # Check if it's a list of lists (batch) or list of tuples (single sequence)
+            if len(offset_mapping) > 0:
+                first_elem = offset_mapping[0]
+                # If first element is a tuple/list of 2 elements, it's a single sequence
+                # If first element is a list of tuples, it's a batch
+                if isinstance(first_elem, (list, tuple)) and len(first_elem) == 2:
+                    # Single sequence: list of (start, end) tuples - use directly
+                    offsets = offset_mapping
+                elif isinstance(first_elem, list) and len(first_elem) > 0:
+                    # Batch: first element is the sequence
+                    offsets = offset_mapping[0]
+                else:
+                    offsets = offset_mapping
+            else:
+                offsets = []
+        elif isinstance(offset_mapping, torch.Tensor):
+            # Convert tensor to list
+            offsets = offset_mapping[0].cpu().tolist() if offset_mapping.dim() > 1 else offset_mapping.cpu().tolist()
+        else:
+            # Try to convert to list
+            try:
+                offsets = list(offset_mapping)
+            except:
+                offsets = []
+        
+        # Split prompt into words and get their character positions
+        # Use a more robust method to find word boundaries
+        import re
+        words = prompt.split()
+        word_char_ranges = []
+        char_pos = 0
+        for word in words:
+            # Find word position using regex to match word boundaries
+            # This handles cases where a word might appear as substring of another word
+            pattern = r'\b' + re.escape(word) + r'\b'
+            match = re.search(pattern, prompt[char_pos:])
+            if match:
+                word_start = char_pos + match.start()
+                word_end = word_start + len(word)
+                word_char_ranges.append((word_start, word_end))
+                char_pos = word_end
+            else:
+                # Fallback: simple find
+                word_start = prompt.find(word, char_pos)
+                if word_start != -1:
+                    word_end = word_start + len(word)
+                    word_char_ranges.append((word_start, word_end))
+                    char_pos = word_end
+        
+        # Map tokens to words based on character offsets
+        word_ids = []
+        for i, offset_pair in enumerate(offsets):
+            try:
+                # Handle different formats: tuple, list, or array
+                if isinstance(offset_pair, (list, tuple)) and len(offset_pair) >= 2:
+                    token_start = int(offset_pair[0])
+                    token_end = int(offset_pair[1])
+                elif hasattr(offset_pair, '__getitem__') and hasattr(offset_pair, '__len__') and len(offset_pair) >= 2:
+                    token_start = int(offset_pair[0])
+                    token_end = int(offset_pair[1])
+                else:
+                    token_start, token_end = 0, 0
+            except (TypeError, IndexError, ValueError, AttributeError) as e:
+                print(f"Warning: Could not parse offset at index {i}: {offset_pair}, error: {e}")
+                token_start, token_end = 0, 0
+            if token_start == token_end == 0:
+                # Special token (BOS/EOS/PAD)
+                word_ids.append(None)
+            else:
+                # Find which word this token belongs to
+                # A token belongs to a word if its start position is within the word's range
+                # Also check if token overlaps with word (token_end > word_start and token_start < word_end)
+                token_word_idx = None
+                for word_idx, (word_start, word_end) in enumerate(word_char_ranges):
+                    # Token overlaps with word if: token_start < word_end AND token_end > word_start
+                    if token_start < word_end and token_end > word_start:
+                        token_word_idx = word_idx
+                        break
+                word_ids.append(token_word_idx)
+        
+        # Convert word indices to token indices
+        token_indices = []
+        for word_idx in word_indices:
+            if word_idx < 0 or word_idx >= len(words):
+                print(f"Warning: Word index {word_idx} is out of range (0-{len(words)-1})")
+                continue
+            # Find all tokens that belong to this word
+            for token_idx, mapped_word_idx in enumerate(word_ids):
+                if mapped_word_idx == word_idx:
+                    token_indices.append(token_idx)
+        
+        return sorted(list(set(token_indices)))  # Remove duplicates and sort
+    
     def analyze(
         self, 
         prompt: str,
         harmful_token_indices: Optional[List[int]] = None,
-        safe_token_indices: Optional[List[int]] = None
+        harmful_word_indices: Optional[List[int]] = None,
+        safe_token_indices: Optional[List[int]] = None,
+        safe_word_indices: Optional[List[int]] = None
     ) -> Dict[int, Dict[str, float]]:
         """
         Analyze attention patterns for a given prompt.
@@ -295,7 +443,9 @@ class AttentionAnalyzer:
         Args:
             prompt: Input text prompt
             harmful_token_indices: List of token indices (0-indexed) that are harmful
+            harmful_word_indices: List of word indices (0-indexed) that are harmful (alternative to harmful_token_indices)
             safe_token_indices: List of token indices (0-indexed) that are safe
+            safe_word_indices: List of word indices (0-indexed) that are safe (alternative to safe_token_indices)
         
         Returns:
             Dictionary mapping layer index to {'ae': float, 'hta': float}
@@ -307,11 +457,24 @@ class AttentionAnalyzer:
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.model.device)
         
-        # Get tokenized text for debugging
+        # Get tokenized text
         tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0])
         seq_len = len(tokens)
-        print(f"\nTokens: {tokens}")
-        print(f"Token indices: {list(range(seq_len))}")
+        words = prompt.split()
+        
+        # Print original prompt first
+        print(f"\nOriginal prompt: {prompt}")
+        
+        # Convert word indices to token indices if provided
+        if harmful_word_indices is not None:
+            if harmful_token_indices is not None:
+                print("Warning: Both harmful_token_indices and harmful_word_indices provided. Using harmful_word_indices.")
+            harmful_token_indices = self._word_indices_to_token_indices(prompt, harmful_word_indices)
+        
+        if safe_word_indices is not None:
+            if safe_token_indices is not None:
+                print("Warning: Both safe_token_indices and safe_word_indices provided. Using safe_word_indices.")
+            safe_token_indices = self._word_indices_to_token_indices(prompt, safe_word_indices)
         
         # If harmful_token_indices is provided, safe_token_indices is automatically
         # set to all other indices. Otherwise, use default heuristic.
@@ -321,11 +484,17 @@ class AttentionAnalyzer:
             harmful_token_indices = [i for i in range(1, seq_len) if i % 2 == 0]
             safe_token_indices = [i for i in range(seq_len) if i not in harmful_token_indices]
         else:
-            # If harmful indices are specified, safe indices are all others
-            safe_token_indices = [i for i in range(seq_len) if i not in harmful_token_indices]
+            # If harmful indices are specified, safe indices are all others (unless explicitly provided)
+            if safe_token_indices is None:
+                safe_token_indices = [i for i in range(seq_len) if i not in harmful_token_indices]
         
-        print(f"Harmful token indices: {harmful_token_indices}")
-        print(f"Safe token indices: {safe_token_indices}")
+        # Print formatted output with actual words and tokens
+        if harmful_word_indices is not None:
+            harmful_words = [words[i] for i in harmful_word_indices if 0 <= i < len(words)]
+            print(f"Harmful words: {harmful_words}")
+        
+        harmful_tokens = [tokens[i] for i in harmful_token_indices if 0 <= i < len(tokens)]
+        print(f"Harmful tokens: {harmful_tokens}")
         
         # Extract attention weights
         attention_weights_dict = self._get_attention_weights(input_ids, attention_mask)
@@ -336,15 +505,15 @@ class AttentionAnalyzer:
             attn_weights = attention_weights_dict[layer_idx]
             # attn_weights: [batch, num_heads, seq_len, seq_len]
             
+            # Compute AE
             ae = self.compute_ae(attn_weights)
+            
             hta = self.compute_hta(attn_weights, harmful_token_indices, safe_token_indices)
             
             results[layer_idx] = {
                 'ae': ae,
                 'hta': hta
             }
-            
-            print(f"Layer {layer_idx}: AE={ae:.4f}, HTA={hta:.4f}")
         
         return results
 
@@ -354,18 +523,22 @@ def load_prompts_from_csv(csv_path: str) -> List[Dict]:
     Load prompts from CSV file.
     
     CSV format:
-    prompt,harmful_indices
+    prompt,harmful_indices,harmful_token_indices
     "prompt text",,
-    "another prompt","1,3"
+    "another prompt","1,3",
+    "yet another","","2,4"
     
-    Note: If harmful_indices is specified, safe_indices will be automatically
-    set to all other token indices.
+    Note: 
+    - harmful_indices: word indices (0-indexed) - will be converted to token indices (default, recommended)
+    - harmful_token_indices: token indices (0-indexed) - use only if you need direct token-level control
+    - If harmful_indices or harmful_token_indices is specified, safe_indices will be automatically
+      set to all other token indices.
     
     Args:
         csv_path: Path to CSV file
     
     Returns:
-        List of dictionaries with 'prompt', 'harmful_indices' keys
+        List of dictionaries with 'prompt', 'harmful_indices', 'harmful_word_indices' keys
     """
     prompts = []
     with open(csv_path, 'r', encoding='utf-8') as f:
@@ -373,7 +546,8 @@ def load_prompts_from_csv(csv_path: str) -> List[Dict]:
         for row in reader:
             prompt_data = {
                 'prompt': row['prompt'].strip(),
-                'harmful_indices': row.get('harmful_indices', '').strip() if row.get('harmful_indices') else None
+                'harmful_word_indices': row.get('harmful_indices', '').strip() if row.get('harmful_indices') else None,  # harmful_indices is treated as word indices
+                'harmful_token_indices': row.get('harmful_token_indices', '').strip() if row.get('harmful_token_indices') else None
             }
             prompts.append(prompt_data)
     return prompts
@@ -432,7 +606,9 @@ def main():
     parser.add_argument("--token", type=str, default=None,
                        help="HuggingFace access token (overrides .env file)")
     parser.add_argument("--harmful-indices", type=str, default=None,
-                       help="Comma-separated list of harmful token indices (0-indexed, overrides CSV). Safe indices will be automatically set to all other tokens.")
+                       help="Comma-separated list of harmful word indices (0-indexed, overrides CSV). Will be converted to token indices. Safe indices will be automatically set to all other tokens. (Default: word indices)")
+    parser.add_argument("--harmful-token-indices", type=str, default=None,
+                       help="Comma-separated list of harmful token indices (0-indexed, overrides CSV). Use only if you need direct token-level control. Safe indices will be automatically set to all other tokens.")
     parser.add_argument("--output-dir", type=str, default="outputs/results",
                        help="Output directory for results")
     
@@ -452,7 +628,8 @@ def main():
         # Single prompt mode
         prompts = [{
             'prompt': args.prompt,
-            'harmful_indices': args.harmful_indices
+            'harmful_word_indices': args.harmful_indices,  # --harmful-indices is treated as word indices
+            'harmful_token_indices': args.harmful_token_indices
         }]
     else:
         # CSV mode
@@ -471,17 +648,19 @@ def main():
     for idx, prompt_data in enumerate(prompts, 1):
         prompt = prompt_data['prompt']
         # Use command-line argument if provided, otherwise use CSV value
-        harmful_indices = parse_indices(args.harmful_indices) if args.harmful_indices else parse_indices(prompt_data.get('harmful_indices'))
+        # Both CSV's 'harmful_indices' and --harmful-indices are treated as word indices (default behavior)
+        harmful_word_indices = parse_indices(args.harmful_indices) if args.harmful_indices else parse_indices(prompt_data.get('harmful_word_indices'))
+        harmful_token_indices = parse_indices(args.harmful_token_indices) if args.harmful_token_indices else parse_indices(prompt_data.get('harmful_token_indices'))
         
         print(f"\n{'='*60}")
         print(f"Processing prompt {idx}/{len(prompts)}")
         print(f"{'='*60}")
-        print(f"Prompt: {prompt}")
         
         # Analyze prompt (safe_indices will be automatically computed from harmful_indices)
         results = analyzer.analyze(
             prompt=prompt,
-            harmful_token_indices=harmful_indices,
+            harmful_token_indices=harmful_token_indices,
+            harmful_word_indices=harmful_word_indices,
             safe_token_indices=None  # Will be auto-computed
         )
         
@@ -489,8 +668,21 @@ def main():
         print("\n=== Summary ===")
         print("Layer\tAE\t\tHTA")
         print("-" * 40)
+        ae_values = []
+        hta_values = []
         for layer_idx in sorted(results.keys()):
-            print(f"{layer_idx}\t{results[layer_idx]['ae']:.6f}\t{results[layer_idx]['hta']:.6f}")
+            ae_val = results[layer_idx]['ae']
+            hta_val = results[layer_idx]['hta']
+            print(f"{layer_idx}\t{ae_val:.6f}\t{hta_val:.6f}")
+            ae_values.append(ae_val)
+            hta_values.append(hta_val)
+        
+        # Print average across all layers
+        if ae_values and hta_values:
+            avg_ae = sum(ae_values) / len(ae_values)
+            avg_hta = sum(hta_values) / len(hta_values)
+            print("-" * 40)
+            print(f"Average\t{avg_ae:.6f}\t{avg_hta:.6f}")
         
         all_results.append({
             'prompt': prompt,
